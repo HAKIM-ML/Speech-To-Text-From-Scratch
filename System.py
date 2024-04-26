@@ -1,0 +1,186 @@
+import torch
+import torchaudio
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+import string
+import numpy as np
+
+# Text Transformation
+class TextTransform:
+    """Maps characters to integers and vice verse, using the string module for character definitions"""
+    
+    def __init__(self):
+        # Including additional characters manually and using string.ascii_lowercase for letters
+        additional_chars = ["''", '<SPACE>']
+        all_chars = additional_chars + list(string.ascii_lowercase)
+        
+        # Generating char_map with enumeration, starting indices from 0
+        self.char_map = {char: i for i, char in enumerate(all_chars)}
+        # Inverting char_map to create index_map
+        self.index_map = {index: char for char, index in self.char_map.items()}
+        self.index_map[self.char_map['<SPACE>']] = ' ' 
+        
+    def text_to_int(self, text):
+        '''Converts text to an integer sequence using a character map'''
+        return [self.char_map.get(c, self.char_map['<SPACE>']) for c in text.lower()]
+    
+    def int_to_text(self, labels):
+        '''Converts integer labels to a text sequence using a character map'''
+        return ''.join(self.index_map[i] for i in labels).replace('<SPACE>', ' ')
+
+# Model Components
+class CNNLayerNorm(nn.Module):
+    """Layer normalization built for CNNs input"""
+    def __init__(self, n_feats):
+        super(CNNLayerNorm, self).__init__()
+        self.layer_norm = nn.LayerNorm(n_feats)
+
+    def forward(self, x):
+        x = x.transpose(2, 3).contiguous() # (batch, channel, time, feature)
+        x = self.layer_norm(x)
+        return x.transpose(2, 3).contiguous() # (batch, channel, feature, time)
+
+class ResidualCNN(nn.Module):
+    """Residual CNN with layer normalization"""
+    def __init__(self, in_channels, out_channels, kernel, stride, dropout, n_feats):
+        super(ResidualCNN, self).__init__()
+
+        self.cnn1 = nn.Conv2d(in_channels, out_channels, kernel, stride, padding=kernel//2)
+        self.cnn2 = nn.Conv2d(out_channels, out_channels, kernel, stride, padding=kernel//2)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.layer_norm1 = CNNLayerNorm(n_feats)
+        self.layer_norm2 = CNNLayerNorm(n_feats)
+
+    def forward(self, x):
+        residual = x
+        x = self.layer_norm1(x)
+        x = F.gelu(x)
+        x = self.dropout1(x)
+        x = self.cnn1(x)
+        x = self.layer_norm2(x)
+        x = F.gelu(x)
+        x = self.dropout2(x)
+        x = self.cnn2(x)
+        x += residual
+        return x
+
+class BidirectionalGRU(nn.Module):
+    def __init__(self, rnn_dim, hidden_size, dropout, batch_first):
+        super(BidirectionalGRU, self).__init__()
+
+        self.BiGRU = nn.GRU(input_size=rnn_dim, hidden_size=hidden_size, num_layers=1, batch_first=batch_first, bidirectional=True)
+        self.layer_norm = nn.LayerNorm(rnn_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.layer_norm(x)
+        x = F.gelu(x)
+        x, _ = self.BiGRU(x)
+        x = self.dropout(x)
+        return x
+
+# Speech Recognition Model
+class SpeechRecognitionModel(nn.Module):
+    """Speech Recognition Model Inspired by DeepSpeech 2"""
+
+    def __init__(self, n_cnn_layers, n_rnn_layers, rnn_dim, n_class, n_feats, stride=2, dropout=0.1):
+        super(SpeechRecognitionModel, self).__init__()
+        n_feats = n_feats//2
+        self.cnn = nn.Conv2d(1, 32, 3, stride=stride, padding=3//2)  # CNN for extracting hierarchical features
+
+        # n residual CNN layers with filter size of 32
+        self.rescnn_layers = nn.Sequential(*[
+            ResidualCNN(32, 32, kernel=3, stride=1, dropout=dropout, n_feats=n_feats)
+            for _ in range(n_cnn_layers)
+        ])
+        self.fully_connected = nn.Linear(n_feats*32, rnn_dim)
+        self.birnn_layers = nn.Sequential(*[
+            BidirectionalGRU(rnn_dim=rnn_dim if i==0 else rnn_dim*2, hidden_size=rnn_dim, dropout=dropout, batch_first=i==0)
+            for i in range(n_rnn_layers)
+        ])
+        self.classifier = nn.Sequential(
+            nn.Linear(rnn_dim*2, rnn_dim),  # BiRNN returns rnn_dim*2
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(rnn_dim, n_class)
+        )
+
+    def forward(self, x):
+        x = self.cnn(x)
+        x = self.rescnn_layers(x)
+        sizes = x.size()
+        x = x.view(sizes[0], sizes[1] * sizes[2], sizes[3])  # (batch, feature, time)
+        x = x.transpose(1, 2) # (batch, time, feature)
+        x = self.fully_connected(x)
+        x = self.birnn_layers(x)
+        x = self.classifier(x)
+        return x
+
+# Greedy Decoder
+def greedy_decoder(output_probs, blank_label=28):
+    """Decodes the output probabilities to the most likely indices sequence."""
+    max_probs, indices = torch.max(output_probs, dim=2)
+    decoded_batches = []
+
+    for idx, sequence in enumerate(indices.transpose(0, 1)):
+        previous = -1
+        decoded_sequence = []
+
+        for label_index in sequence:
+            if label_index != previous and label_index != blank_label:
+                decoded_sequence.append(label_index.item())
+            previous = label_index
+
+        decoded_batches.append(decoded_sequence)
+
+    return decoded_batches
+
+# Function to load the saved model
+def load_model(model_path):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SpeechRecognitionModel(n_cnn_layers=3, n_rnn_layers=5, rnn_dim=512, n_class=29, n_feats=128)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    return model
+
+# Function to perform speech-to-text conversion
+def speech_to_text(audio_path, model, device, text_transform, valid_audio_transforms):
+    # Load the audio file
+    waveform, sample_rate = torchaudio.load(audio_path)
+
+    # Apply audio transformations
+    waveform = valid_audio_transforms(waveform)
+
+    # Create a tensor and move it to the device
+    waveform = waveform.unsqueeze(0).to(device)
+
+    # Move the model to the device
+    model = model.to(device)
+
+    # Run the model on the audio input
+    output = model(waveform)
+
+    output = F.log_softmax(output, dim=2)
+    output = output.transpose(0, 1)
+
+    # Decode the output probabilities to text
+    decoded_output = greedy_decoder(output)
+    predicted_text = text_transform.int_to_text(decoded_output[0])
+
+    return predicted_text
+
+# Load the saved model
+model_path = 'speech_recognition_model.pth'
+loaded_model = load_model(model_path)
+
+# Create instances of TextTransform and valid_audio_transforms
+text_transform = TextTransform()
+valid_audio_transforms = torchaudio.transforms.MelSpectrogram()
+
+# Example usage
+audio_path = '1580-141084-0001.wav'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+predicted_text = speech_to_text(audio_path, loaded_model, device, text_transform, valid_audio_transforms)
+print(f"Predicted Text: {predicted_text}")
